@@ -29,6 +29,7 @@ var Verbose = false
 // Device represents a connection to an EZIO-G500 LCD display.
 type Device struct {
 	portPath     string
+	port         *os.File // Direct file handle to serial port
 	mu           sync.Mutex
 	commandDelay time.Duration
 	buffer       bytes.Buffer // Buffer to collect data to send
@@ -51,45 +52,75 @@ func debugf(format string, args ...interface{}) {
 func Open(portPath string) (*Device, error) {
 	debugf("Opening port: %s at %d baud", portPath, DefaultBaudRate)
 
+	// Configure serial port using stty (one-time setup)
+	cmd := exec.Command("stty", "-f", portPath, fmt.Sprintf("%d", DefaultBaudRate), "cs8", "-cstopb", "-parenb", "raw", "-echo")
+	if err := cmd.Run(); err != nil {
+		debugf("stty failed: %v (continuing anyway)", err)
+	}
+
+	// Open the serial port directly
+	port, err := os.OpenFile(portPath, os.O_RDWR, 0)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open serial port: %w", err)
+	}
+
 	d := &Device{
 		portPath:     portPath,
+		port:         port,
 		commandDelay: DefaultCommandDelay,
 	}
 
 	return d, nil
 }
 
-// OpenWithoutStty is the same as Open (kept for API compatibility)
+// OpenWithoutStty opens without stty configuration (for testing)
 func OpenWithoutStty(portPath string) (*Device, error) {
-	return Open(portPath)
+	port, err := os.OpenFile(portPath, os.O_RDWR, 0)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open serial port: %w", err)
+	}
+
+	return &Device{
+		portPath:     portPath,
+		port:         port,
+		commandDelay: DefaultCommandDelay,
+	}, nil
 }
 
 // Close closes the connection to the display.
-// This flushes any buffered data using cu.
 func (d *Device) Close() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	debugf("Closing port (flushing buffer)")
+	debugf("Closing port")
 
 	// Flush any remaining data
 	if d.buffer.Len() > 0 {
-		if err := d.flushWithCu(); err != nil {
-			return err
+		if err := d.flushDirect(); err != nil {
+			debugf("Error flushing on close: %v", err)
 		}
 	}
 
+	if d.port != nil {
+		err := d.port.Close()
+		d.port = nil
+		return err
+	}
 	return nil
 }
 
-// flushWithCu sends buffered data using cu
-func (d *Device) flushWithCu() error {
+// flushDirect sends buffered data directly to the serial port (no cu!)
+func (d *Device) flushDirect() error {
 	if d.buffer.Len() == 0 {
 		return nil
 	}
 
+	if d.port == nil {
+		return fmt.Errorf("serial port not open")
+	}
+
 	data := d.buffer.Bytes()
-	debugf("Flushing %d bytes via cu", len(data))
+	debugf("Flushing %d bytes directly", len(data))
 
 	// Debug: show what we're writing
 	if Verbose {
@@ -100,50 +131,14 @@ func (d *Device) flushWithCu() error {
 		}
 	}
 
-	// Use cu to send data - this is what actually works!
-	cmd := exec.Command("cu", "-l", d.portPath, "-s", fmt.Sprintf("%d", DefaultBaudRate))
-
-	stdin, err := cmd.StdinPipe()
+	// Write directly to the serial port
+	_, err := d.port.Write(data)
 	if err != nil {
-		return fmt.Errorf("failed to create stdin pipe: %w", err)
+		return fmt.Errorf("failed to write to serial port: %w", err)
 	}
 
-	// Start cu
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start cu: %w", err)
-	}
-
-	// Write data to cu's stdin
-	_, err = stdin.Write(data)
-	if err != nil {
-		cmd.Process.Kill()
-		return fmt.Errorf("failed to write to cu: %w", err)
-	}
-
-	// Small delay to let cu process the data
-	time.Sleep(100 * time.Millisecond)
-
-	// Close stdin to signal EOF
-	stdin.Close()
-
-	// Send ~. to exit cu cleanly (via separate write if needed)
-	// Actually, closing stdin should cause cu to exit
-
-	// Wait for cu to finish with a timeout
-	done := make(chan error, 1)
-	go func() {
-		done <- cmd.Wait()
-	}()
-
-	select {
-	case err := <-done:
-		if err != nil {
-			debugf("cu exited with: %v (this is often OK)", err)
-		}
-	case <-time.After(2 * time.Second):
-		debugf("cu timeout, killing process")
-		cmd.Process.Kill()
-	}
+	// Sync to ensure data is sent
+	d.port.Sync()
 
 	// Clear the buffer
 	d.buffer.Reset()
@@ -186,17 +181,19 @@ func (d *Device) Write(data []byte) error {
 	return nil
 }
 
-// Flush sends all buffered data immediately using cu
+// Flush sends all buffered data immediately
 func (d *Device) Flush() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.flushWithCu()
+	return d.flushDirect()
 }
 
 // Read reads bytes from the display (for button input).
-// Note: This is not yet implemented with cu-based approach
 func (d *Device) Read(buf []byte) (int, error) {
-	return 0, io.EOF
+	if d.port == nil {
+		return 0, io.EOF
+	}
+	return d.port.Read(buf)
 }
 
 // PortPath returns the serial port path.
@@ -204,79 +201,50 @@ func (d *Device) PortPath() string {
 	return d.portPath
 }
 
-// PersistentSession represents a long-running cu session for bidirectional I/O.
+// PersistentSession represents a long-running session for bidirectional I/O.
+// Now uses direct file I/O instead of spawning cu processes.
 type PersistentSession struct {
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	stdout io.ReadCloser
-	mu     sync.Mutex
+	port *os.File
+	mu   sync.Mutex
 }
 
-// StartSession starts a persistent cu session for bidirectional communication.
-// This is needed for button monitoring while also sending display commands.
+// StartSession starts a persistent session for bidirectional communication.
 func (d *Device) StartSession() (*PersistentSession, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	debugf("Starting persistent session on %s", d.portPath)
 
-	cmd := exec.Command("cu", "-l", d.portPath, "-s", fmt.Sprintf("%d", DefaultBaudRate))
+	// Use the existing port if available, otherwise open a new one
+	if d.port != nil {
+		return &PersistentSession{port: d.port}, nil
+	}
 
-	stdin, err := cmd.StdinPipe()
+	// Configure serial port
+	cmd := exec.Command("stty", "-f", d.portPath, fmt.Sprintf("%d", DefaultBaudRate), "cs8", "-cstopb", "-parenb", "raw", "-echo")
+	if err := cmd.Run(); err != nil {
+		debugf("stty failed: %v", err)
+	}
+
+	port, err := os.OpenFile(d.portPath, os.O_RDWR, 0)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create stdin pipe: %w", err)
+		return nil, fmt.Errorf("failed to open serial port: %w", err)
 	}
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		stdin.Close()
-		return nil, fmt.Errorf("failed to create stdout pipe: %w", err)
-	}
-
-	if err := cmd.Start(); err != nil {
-		stdin.Close()
-		stdout.Close()
-		return nil, fmt.Errorf("failed to start cu: %w", err)
-	}
-
-	session := &PersistentSession{
-		cmd:    cmd,
-		stdin:  stdin,
-		stdout: stdout,
-	}
-
-	// cu outputs "Connected" on startup - drain this before returning
-	// Read until we get the newline after "Connected\n"
-	drainBuf := make([]byte, 64)
-	for {
-		n, err := stdout.Read(drainBuf)
-		if err != nil || n == 0 {
-			break
-		}
-		debugf("Draining cu startup: %q", string(drainBuf[:n]))
-		// Check if we've received the newline (end of Connected message)
-		if bytes.Contains(drainBuf[:n], []byte{'\n'}) {
-			break
-		}
-	}
-
-	// Small additional delay to let things settle
-	time.Sleep(50 * time.Millisecond)
 
 	debugf("Persistent session started")
-	return session, nil
+	return &PersistentSession{port: port}, nil
 }
 
 // Write sends data to the display via the persistent session.
 func (ps *PersistentSession) Write(data []byte) (int, error) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
-	return ps.stdin.Write(data)
+	return ps.port.Write(data)
 }
 
 // Read reads data from the display (button presses).
 func (ps *PersistentSession) Read(buf []byte) (int, error) {
-	return ps.stdout.Read(buf)
+	return ps.port.Read(buf)
 }
 
 // Close ends the persistent session.
@@ -285,22 +253,7 @@ func (ps *PersistentSession) Close() error {
 	defer ps.mu.Unlock()
 
 	debugf("Closing persistent session")
-
-	// Close stdin to signal EOF
-	ps.stdin.Close()
-
-	// Give cu a moment to exit
-	done := make(chan error, 1)
-	go func() {
-		done <- ps.cmd.Wait()
-	}()
-
-	select {
-	case <-done:
-		// Ok
-	case <-time.After(2 * time.Second):
-		ps.cmd.Process.Kill()
-	}
-
+	// Don't close the port here - it may be shared with the Device
+	// The Device.Close() will handle port cleanup
 	return nil
 }

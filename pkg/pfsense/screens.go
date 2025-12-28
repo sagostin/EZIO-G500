@@ -4,6 +4,7 @@ package pfsense
 import (
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -32,6 +33,7 @@ type StatusDaemon struct {
 	lastSampleTime time.Time
 	ifaceRates     map[string]ifaceRate
 	cachedMetrics  *Metrics // Cached metrics to reduce process spawning
+	lastScreenHash uint64   // For dirty-frame detection
 }
 
 type ifaceBytes struct{ tx, rx uint64 }
@@ -58,10 +60,13 @@ func NewMetricsHistory(maxSamples int) *MetricsHistory {
 }
 
 func (h *MetricsHistory) AddSample(m *Metrics) {
-	h.CPUHistory = append(h.CPUHistory, m.CPU)
-	if len(h.CPUHistory) > h.maxSamples {
-		h.CPUHistory = h.CPUHistory[1:]
+	// Use proper ring buffer pattern to avoid memory leak from slice-from-slice
+	if len(h.CPUHistory) >= h.maxSamples {
+		copy(h.CPUHistory, h.CPUHistory[1:])
+		h.CPUHistory = h.CPUHistory[:h.maxSamples-1]
 	}
+	h.CPUHistory = append(h.CPUHistory, m.CPU)
+
 	now := time.Now()
 	var totalTx, totalRx uint64
 	for _, iface := range m.Interfaces {
@@ -71,14 +76,20 @@ func (h *MetricsHistory) AddSample(m *Metrics) {
 	if !h.lastSampleTime.IsZero() {
 		elapsed := now.Sub(h.lastSampleTime).Seconds()
 		if elapsed > 0 {
-			h.TxRateHistory = append(h.TxRateHistory, float64(totalTx-h.lastTxBytes)/elapsed)
-			h.RxRateHistory = append(h.RxRateHistory, float64(totalRx-h.lastRxBytes)/elapsed)
-			if len(h.TxRateHistory) > h.maxSamples {
-				h.TxRateHistory = h.TxRateHistory[1:]
+			txRate := float64(totalTx-h.lastTxBytes) / elapsed
+			rxRate := float64(totalRx-h.lastRxBytes) / elapsed
+
+			if len(h.TxRateHistory) >= h.maxSamples {
+				copy(h.TxRateHistory, h.TxRateHistory[1:])
+				h.TxRateHistory = h.TxRateHistory[:h.maxSamples-1]
 			}
-			if len(h.RxRateHistory) > h.maxSamples {
-				h.RxRateHistory = h.RxRateHistory[1:]
+			h.TxRateHistory = append(h.TxRateHistory, txRate)
+
+			if len(h.RxRateHistory) >= h.maxSamples {
+				copy(h.RxRateHistory, h.RxRateHistory[1:])
+				h.RxRateHistory = h.RxRateHistory[:h.maxSamples-1]
 			}
+			h.RxRateHistory = append(h.RxRateHistory, rxRate)
 		}
 	}
 	h.lastTxBytes, h.lastRxBytes, h.lastSampleTime = totalTx, totalRx, now
@@ -90,7 +101,7 @@ func NewStatusDaemon(d *display.Display, updateInterval, rotateInterval time.Dur
 		metrics:        NewSystemMetrics(),
 		updateInterval: updateInterval,
 		rotateInterval: rotateInterval,
-		history:        NewMetricsHistory(60),
+		history:        NewMetricsHistory(12), // 12 samples = 1 minute at 5s intervals
 		lastIfaceBytes: make(map[string]ifaceBytes),
 		ifaceRates:     make(map[string]ifaceRate),
 	}
@@ -110,61 +121,94 @@ func NewStatusDaemon(d *display.Display, updateInterval, rotateInterval time.Dur
 
 func (sd *StatusDaemon) AddScreen(s StatusScreen) { sd.screens = append(sd.screens, s) }
 
+// startMetricsCollector runs metrics collection in a background goroutine
+// This decouples metrics fetching from display rendering to prevent blocking
+func (sd *StatusDaemon) startMetricsCollector() {
+	go func() {
+		ticker := time.NewTicker(5 * time.Second) // Fetch metrics every 5 seconds
+		defer ticker.Stop()
+
+		// Initial fetch
+		sd.fetchMetrics()
+
+		for range ticker.C {
+			sd.fetchMetrics()
+		}
+	}()
+}
+
+// fetchMetrics collects metrics and updates cache (runs in background)
+func (sd *StatusDaemon) fetchMetrics() {
+	metrics, err := sd.metrics.GetMetrics()
+	if err != nil {
+		return // Silently ignore errors, use cached data
+	}
+
+	sd.cachedMetrics = metrics
+	sd.history.AddSample(metrics)
+
+	// Build set of current interface names for pruning
+	currentIfaces := make(map[string]bool, len(metrics.Interfaces))
+	for _, iface := range metrics.Interfaces {
+		currentIfaces[iface.Name] = true
+	}
+
+	// Prune stale interfaces from maps to prevent unbounded growth
+	for name := range sd.lastIfaceBytes {
+		if !currentIfaces[name] {
+			delete(sd.lastIfaceBytes, name)
+			delete(sd.ifaceRates, name)
+		}
+	}
+
+	// Calculate per-interface rates
+	now := time.Now()
+	if !sd.lastSampleTime.IsZero() {
+		elapsed := now.Sub(sd.lastSampleTime).Seconds()
+		if elapsed > 0 {
+			for _, iface := range metrics.Interfaces {
+				if last, ok := sd.lastIfaceBytes[iface.Name]; ok {
+					sd.ifaceRates[iface.Name] = ifaceRate{
+						txRate: float64(iface.TxBytes-last.tx) / elapsed,
+						rxRate: float64(iface.RxBytes-last.rx) / elapsed,
+					}
+				}
+				sd.lastIfaceBytes[iface.Name] = ifaceBytes{tx: iface.TxBytes, rx: iface.RxBytes}
+			}
+		}
+	}
+	sd.lastSampleTime = now
+}
+
 func (sd *StatusDaemon) Run() error {
-	animTicker := time.NewTicker(100 * time.Millisecond)
+	// Start background metrics collection (completely separate from display)
+	sd.startMetricsCollector()
+
+	animTicker := time.NewTicker(500 * time.Millisecond) // 2Hz animation
 	rotateTicker := time.NewTicker(sd.rotateInterval)
 	defer animTicker.Stop()
 	defer rotateTicker.Stop()
-	sd.update()
+
 	for {
 		select {
 		case <-animTicker.C:
 			sd.frameCount++
-			sd.update()
+			sd.render()
 		case <-rotateTicker.C:
 			sd.currentScreen = (sd.currentScreen + 1) % len(sd.screens)
 		}
 	}
 }
 
-func (sd *StatusDaemon) update() error {
-	// Only fetch metrics every 10 frames (1Hz) to reduce process spawning
-	// This prevents "Cannot allocate memory" errors from excessive fork/exec
-	if sd.frameCount%10 == 0 || sd.cachedMetrics == nil {
-		metrics, err := sd.metrics.GetMetrics()
-		if err != nil {
-			return err
-		}
-		sd.cachedMetrics = metrics
-		sd.history.AddSample(metrics)
-
-		// Calculate per-interface rates (only when we have fresh data)
-		now := time.Now()
-		if !sd.lastSampleTime.IsZero() {
-			elapsed := now.Sub(sd.lastSampleTime).Seconds()
-			if elapsed > 0 {
-				for _, iface := range metrics.Interfaces {
-					if last, ok := sd.lastIfaceBytes[iface.Name]; ok {
-						sd.ifaceRates[iface.Name] = ifaceRate{
-							txRate: float64(iface.TxBytes-last.tx) / elapsed,
-							rxRate: float64(iface.RxBytes-last.rx) / elapsed,
-						}
-					}
-					sd.lastIfaceBytes[iface.Name] = ifaceBytes{tx: iface.TxBytes, rx: iface.RxBytes}
-				}
-			}
-		}
-		sd.lastSampleTime = now
-
-		// Update LEDs based on thresholds (only on metrics refresh)
-		sd.updateLEDs(metrics)
-	}
-
-	// Use cached metrics for rendering (animations still run at 10Hz)
+// render draws the current screen using cached metrics (no blocking I/O)
+func (sd *StatusDaemon) render() error {
 	metrics := sd.cachedMetrics
 	if metrics == nil {
-		return nil
+		return nil // No metrics yet, skip render
 	}
+
+	// Update LEDs based on current metrics
+	sd.updateLEDs(metrics)
 
 	if sd.currentScreen < len(sd.screens) {
 		// Pass frame to all screens for smooth animations
@@ -244,10 +288,10 @@ func scrollText(text string, maxLen, frame int) string {
 	padded := text + "    "
 	textLen := len(padded)
 
-	// Scroll speed: every 3 frames (300ms per character) - readable but smooth
-	// With a pause at the beginning
-	pauseFrames := 10 // Pause for 1 second at start
-	cycleLen := textLen + pauseFrames
+	// Scroll speed: every 5 frames (500ms per character) - slower for readability
+	// With a longer pause at the beginning
+	pauseFrames := 20 // Pause for 2 seconds at start
+	cycleLen := textLen*5 + pauseFrames
 
 	adjustedFrame := frame % cycleLen
 
@@ -257,7 +301,7 @@ func scrollText(text string, maxLen, frame int) string {
 	}
 
 	// Scroll position
-	pos := (adjustedFrame - pauseFrames) / 3
+	pos := (adjustedFrame - pauseFrames) / 5
 	if pos >= textLen {
 		pos = pos % textLen
 	}
@@ -344,8 +388,8 @@ func (s *LogoScreen) Render(disp *display.Display, m *Metrics) error {
 	fb.Clear()
 	f := font.BuiltinFont
 
-	// Draw rotating 3D pf logo on left
-	draw3DPF(fb, 28, 32, s.frame)
+	// Draw static pf logo on left (no animation to reduce CPU usage)
+	draw3DPF(fb, 28, 32, 0)
 
 	// Info on right
 	x := 58
@@ -434,6 +478,10 @@ func (s *InterfaceScreen) Render(d *display.Display, m *Metrics) error {
 			active = append(active, iface)
 		}
 	}
+	// Sort by total traffic (highest first)
+	sort.Slice(active, func(i, j int) bool {
+		return (active[i].TxBytes + active[i].RxBytes) > (active[j].TxBytes + active[j].RxBytes)
+	})
 
 	maxVis := 5
 	total := len(active)
@@ -524,6 +572,10 @@ func (s *TunnelTrafficScreen) Render(d *display.Display, m *Metrics) error {
 			tunnels = append(tunnels, iface)
 		}
 	}
+	// Sort by total traffic (highest first)
+	sort.Slice(tunnels, func(i, j int) bool {
+		return (tunnels[i].TxBytes + tunnels[i].RxBytes) > (tunnels[j].TxBytes + tunnels[j].RxBytes)
+	})
 
 	maxVis := 5
 	total := len(tunnels)
@@ -587,6 +639,10 @@ func (s *LANTrafficScreen) Render(d *display.Display, m *Metrics) error {
 		}
 		lans = append(lans, iface)
 	}
+	// Sort by total traffic (highest first)
+	sort.Slice(lans, func(i, j int) bool {
+		return (lans[i].TxBytes + lans[i].RxBytes) > (lans[j].TxBytes + lans[j].RxBytes)
+	})
 
 	maxVis := 5
 	total := len(lans)

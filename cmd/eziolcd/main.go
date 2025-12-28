@@ -293,12 +293,12 @@ func cmdDaemon() error {
 
 	if *verbose {
 		fmt.Printf("Starting status daemon on %s\n", *portPath)
-		fmt.Printf("Update interval: %s, Screen rotation: 5s\n", *refreshRate)
+		fmt.Printf("Update interval: %s, Screen rotation: 10s\n", *refreshRate)
 	}
 
 	// Create status daemon with rotating screens
-	// Updates every refreshRate, rotates screens every 5 seconds
-	daemon := pfsense.NewStatusDaemon(disp, *refreshRate, 5*time.Second)
+	// Updates every refreshRate, rotates screens every 10 seconds
+	daemon := pfsense.NewStatusDaemon(disp, *refreshRate, 10*time.Second)
 
 	// Run the daemon (blocks forever)
 	return daemon.Run()
