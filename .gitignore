@@ -1,6 +1,6 @@
-# Binaries
-eziolcd
-eziolcd-*
+# Binaries (root-level only, not cmd/eziolcd/ dir)
+/eziolcd
+/eziolcd-*
 *.exe
 
 # Build artifacts
