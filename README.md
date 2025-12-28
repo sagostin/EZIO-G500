@@ -4,13 +4,34 @@ A Go library for the EZIO-G500 graphics LCD display found in Checkpoint/pfSense 
 
 ## Features
 
-- **Status Daemon** - 7 rotating screens with live system metrics
-- **3D Animated Logo** - Rotating "pf" letters with smooth animation
-- **LED Health Indicators** - CPU/memory threshold alerts (green/orange/red)
-- **Live Bandwidth Monitoring** - Per-interface KB/s rates
-- **128x64 Graphics** - Full framebuffer with drawing primitives
-- **Smooth Scrolling** - For long text and interface lists
-- **pfSense Integration** - CPU, memory, interfaces, WireGuard tunnels
+- **Status Daemon** — 7 rotating screens with live system metrics
+- **Animated Logo** — Rotating 3D "pf" with smooth 10Hz animation
+- **LED Health Indicators** — CPU/memory threshold alerts (green/orange/red)
+- **Live Bandwidth** — Per-interface KB/s rates sorted by traffic
+- **128x64 Graphics** — Full framebuffer with drawing primitives
+- **Memory Optimized** — Background metrics, ring buffers, stale pruning
+- **pfSense Integration** — CPU, memory, interfaces, WireGuard tunnels
+
+## Architecture
+
+```
+┌─────────────────┐     ┌─────────────────┐
+│ Metrics Thread  │     │  Display Thread │
+│ (every 5 sec)   │────▸│  (2Hz/10Hz)     │
+│ sysctl, netstat │     │  render cache   │
+└─────────────────┘     └─────────────────┘
+         │                       │
+         ▼                       ▼
+    ┌─────────┐           ┌───────────┐
+    │  Cache  │           │ Serial I/O│
+    └─────────┘           │ (direct)  │
+                          └───────────┘
+```
+
+- **Metrics thread**: Fetches system data every 5 seconds
+- **Display thread**: Reads from cache, never blocks on I/O
+- **Adaptive frame rate**: 10Hz for logo, 2Hz for other screens
+- **Direct serial I/O**: No subprocess spawning during operation
 
 ## Quick Start (pfSense)
 
@@ -18,28 +39,21 @@ A Go library for the EZIO-G500 graphics LCD display found in Checkpoint/pfSense 
 # SSH to your pfSense device
 ssh root@your-pfsense-ip
 
-# Download and install the service
+# Download and install
 fetch -o install.sh https://raw.githubusercontent.com/sagostin/ezio-g500/main/scripts/install-pfsense.sh
-chmod +x install.sh
-./install.sh
+chmod +x install.sh && ./install.sh
 ```
-
-The installer will:
-- Download the binary
-- Create an rc.d service
-- Enable it in rc.conf
-- Start the daemon automatically
 
 ## Status Screens
 
-The daemon cycles through 7 screens every 5 seconds:
+The daemon cycles through 7 screens (10 seconds each):
 
 | Screen | Content |
 |--------|---------|
 | **Logo** | 3D rotating pf, hostname, uptime, CPU/MEM |
 | **CPU** | Usage bar, load average, uptime |
 | **Memory** | Usage bar, used/free MB |
-| **Interfaces** | Active interfaces with IPs |
+| **Interfaces** | Active interfaces with IPs (sorted by traffic) |
 | **WAN Traffic** | Live WAN bandwidth (KB/s) |
 | **Tunnel Traffic** | VPN/WireGuard bandwidth |
 | **LAN Traffic** | Other interfaces bandwidth |
@@ -64,14 +78,11 @@ eziolcd -port /dev/cuau1 status
 # Display text
 eziolcd -port /dev/cuau1 text "Hello World"
 
-# Run demo
-eziolcd -port /dev/cuau1 demo
-
 # Control LEDs
 eziolcd -port /dev/cuau1 led 1 green
 ```
 
-## Building from Source
+## Building
 
 ```bash
 git clone https://github.com/sagostin/ezio-g500.git
@@ -80,7 +91,7 @@ cd ezio-g500
 # Build for pfSense
 GOOS=freebsd GOARCH=amd64 go build -o eziolcd-freebsd-amd64 ./cmd/eziolcd
 
-# Deploy to device
+# Deploy
 cd scripts && ./deploy.sh install
 ```
 

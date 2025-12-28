@@ -184,7 +184,11 @@ func (sd *StatusDaemon) Run() error {
 	// Start background metrics collection (completely separate from display)
 	sd.startMetricsCollector()
 
-	animTicker := time.NewTicker(500 * time.Millisecond) // 2Hz animation
+	// Adaptive frame rate: 10Hz for logo, 2Hz for other screens
+	logoInterval := 100 * time.Millisecond  // 10Hz for smooth logo animation
+	otherInterval := 500 * time.Millisecond // 2Hz for static screens
+
+	animTicker := time.NewTicker(logoInterval)
 	rotateTicker := time.NewTicker(sd.rotateInterval)
 	defer animTicker.Stop()
 	defer rotateTicker.Stop()
@@ -196,6 +200,13 @@ func (sd *StatusDaemon) Run() error {
 			sd.render()
 		case <-rotateTicker.C:
 			sd.currentScreen = (sd.currentScreen + 1) % len(sd.screens)
+			// Adjust animation rate based on screen type
+			animTicker.Stop()
+			if sd.currentScreen == 0 { // Logo screen
+				animTicker = time.NewTicker(logoInterval)
+			} else {
+				animTicker = time.NewTicker(otherInterval)
+			}
 		}
 	}
 }
@@ -388,8 +399,8 @@ func (s *LogoScreen) Render(disp *display.Display, m *Metrics) error {
 	fb.Clear()
 	f := font.BuiltinFont
 
-	// Draw static pf logo on left (no animation to reduce CPU usage)
-	draw3DPF(fb, 28, 32, 0)
+	// Draw rotating 3D pf logo on left (10Hz animation)
+	draw3DPF(fb, 28, 32, s.frame)
 
 	// Info on right
 	x := 58
