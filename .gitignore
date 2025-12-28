@@ -1,0 +1,33 @@
+# Binaries
+eziolcd
+eziolcd-*
+*.exe
+
+# Build artifacts
+dist/
+coverage.out
+coverage.html
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Debug
+*.log
+*.prof
+
+# Test artifacts
+*.test
+
+# Local environment (contains credentials)
+.env
+.env.local
+scripts/.env
+.reverse-engineering/
