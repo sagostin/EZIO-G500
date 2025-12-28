@@ -291,6 +291,9 @@ func (s *SystemMetrics) getLoadAvg() ([3]float64, error) {
 func (s *SystemMetrics) getInterfaces() ([]InterfaceMetrics, error) {
 	var result []InterfaceMetrics
 
+	// Pre-fetch all interface stats with a single netstat call (instead of one per interface)
+	ifaceStats := s.getAllInterfaceStats()
+
 	// Run ifconfig to get interface details including descriptions
 	out, err := exec.Command("ifconfig").Output()
 	if err != nil {
@@ -310,10 +313,11 @@ func (s *SystemMetrics) getInterfaces() ([]InterfaceMetrics, error) {
 					!strings.HasPrefix(current.Name, "pflog") &&
 					!strings.HasPrefix(current.Name, "pfsync") &&
 					!strings.HasPrefix(current.Name, "enc") {
-					// Get traffic stats
-					rx, tx := s.getInterfaceStats(current.Name)
-					current.RxBytes = rx
-					current.TxBytes = tx
+					// Get traffic stats from pre-fetched map
+					if stats, ok := ifaceStats[current.Name]; ok {
+						current.RxBytes = stats.rx
+						current.TxBytes = stats.tx
+					}
 					result = append(result, *current)
 				}
 			}
@@ -359,14 +363,49 @@ func (s *SystemMetrics) getInterfaces() ([]InterfaceMetrics, error) {
 			!strings.HasPrefix(current.Name, "pflog") &&
 			!strings.HasPrefix(current.Name, "pfsync") &&
 			!strings.HasPrefix(current.Name, "enc") {
-			rx, tx := s.getInterfaceStats(current.Name)
-			current.RxBytes = rx
-			current.TxBytes = tx
+			if stats, ok := ifaceStats[current.Name]; ok {
+				current.RxBytes = stats.rx
+				current.TxBytes = stats.tx
+			}
 			result = append(result, *current)
 		}
 	}
 
 	return result, nil
+}
+
+type ifaceStatsEntry struct{ rx, tx uint64 }
+
+// getAllInterfaceStats runs netstat -ibn once and returns a map of interface stats.
+// This is much more efficient than calling getInterfaceStats per interface.
+func (s *SystemMetrics) getAllInterfaceStats() map[string]ifaceStatsEntry {
+	result := make(map[string]ifaceStatsEntry)
+
+	out, err := exec.Command("netstat", "-ibn").Output()
+	if err != nil {
+		return result
+	}
+
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		parts := strings.Fields(line)
+		if len(parts) < 11 {
+			continue
+		}
+
+		// Check for <Link#N> entries which have total byte counts
+		if !strings.Contains(parts[2], "<Link#") {
+			continue
+		}
+
+		ifaceName := strings.TrimSuffix(parts[0], "*")
+
+		rx, _ := strconv.ParseUint(parts[7], 10, 64)
+		tx, _ := strconv.ParseUint(parts[10], 10, 64)
+		result[ifaceName] = ifaceStatsEntry{rx: rx, tx: tx}
+	}
+
+	return result
 }
 
 // getInterfaceStats gets RX/TX bytes for an interface using netstat.

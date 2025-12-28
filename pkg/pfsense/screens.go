@@ -31,6 +31,7 @@ type StatusDaemon struct {
 	lastIfaceBytes map[string]ifaceBytes
 	lastSampleTime time.Time
 	ifaceRates     map[string]ifaceRate
+	cachedMetrics  *Metrics // Cached metrics to reduce process spawning
 }
 
 type ifaceBytes struct{ tx, rx uint64 }
@@ -127,38 +128,46 @@ func (sd *StatusDaemon) Run() error {
 }
 
 func (sd *StatusDaemon) update() error {
-	metrics, err := sd.metrics.GetMetrics()
-	if err != nil {
-		return err
-	}
-	sd.history.AddSample(metrics)
+	// Only fetch metrics every 10 frames (1Hz) to reduce process spawning
+	// This prevents "Cannot allocate memory" errors from excessive fork/exec
+	if sd.frameCount%10 == 0 || sd.cachedMetrics == nil {
+		metrics, err := sd.metrics.GetMetrics()
+		if err != nil {
+			return err
+		}
+		sd.cachedMetrics = metrics
+		sd.history.AddSample(metrics)
 
-	// Calculate per-interface rates
-	now := time.Now()
-	if !sd.lastSampleTime.IsZero() {
-		elapsed := now.Sub(sd.lastSampleTime).Seconds()
-		if elapsed > 0 {
-			for _, iface := range metrics.Interfaces {
-				if last, ok := sd.lastIfaceBytes[iface.Name]; ok {
-					sd.ifaceRates[iface.Name] = ifaceRate{
-						txRate: float64(iface.TxBytes-last.tx) / elapsed,
-						rxRate: float64(iface.RxBytes-last.rx) / elapsed,
+		// Calculate per-interface rates (only when we have fresh data)
+		now := time.Now()
+		if !sd.lastSampleTime.IsZero() {
+			elapsed := now.Sub(sd.lastSampleTime).Seconds()
+			if elapsed > 0 {
+				for _, iface := range metrics.Interfaces {
+					if last, ok := sd.lastIfaceBytes[iface.Name]; ok {
+						sd.ifaceRates[iface.Name] = ifaceRate{
+							txRate: float64(iface.TxBytes-last.tx) / elapsed,
+							rxRate: float64(iface.RxBytes-last.rx) / elapsed,
+						}
 					}
+					sd.lastIfaceBytes[iface.Name] = ifaceBytes{tx: iface.TxBytes, rx: iface.RxBytes}
 				}
-				sd.lastIfaceBytes[iface.Name] = ifaceBytes{tx: iface.TxBytes, rx: iface.RxBytes}
 			}
 		}
-	}
-	sd.lastSampleTime = now
+		sd.lastSampleTime = now
 
-	// Update LEDs based on thresholds
-	// LED1 (top) = Info: green when on logo screen, off otherwise
-	// LED2 (middle) = Health: green=good, orange=warning, red=critical
-	// LED3 (bottom) = Home indicator: green on logo screen
-	sd.updateLEDs(metrics)
+		// Update LEDs based on thresholds (only on metrics refresh)
+		sd.updateLEDs(metrics)
+	}
+
+	// Use cached metrics for rendering (animations still run at 10Hz)
+	metrics := sd.cachedMetrics
+	if metrics == nil {
+		return nil
+	}
 
 	if sd.currentScreen < len(sd.screens) {
-		// Pass frame to all screens
+		// Pass frame to all screens for smooth animations
 		switch s := sd.screens[sd.currentScreen].(type) {
 		case *LogoScreen:
 			s.frame = sd.frameCount
